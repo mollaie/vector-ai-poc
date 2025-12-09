@@ -21,6 +21,9 @@ from src.services.async_embedding_service import get_async_embedding_service
 
 logger = logging.getLogger(__name__)
 
+# Salary tolerance for "close match" suggestions (15% below requested)
+SALARY_TOLERANCE = 0.15
+
 
 class MatchingService:
     """Service for matching candidates with jobs.
@@ -155,7 +158,10 @@ class MatchingService:
         additional_criteria: Optional[str],
         num_results: int
     ) -> dict:
-        """Perform vector-based semantic search.
+        """Perform vector-based semantic search with post-filtering.
+        
+        Vector search finds semantically similar jobs, then we apply
+        strict filters (salary, location) with tolerance for close matches.
         
         Args:
             candidate: The candidate to match
@@ -163,7 +169,7 @@ class MatchingService:
             num_results: Number of results to return
             
         Returns:
-            Dictionary with matches
+            Dictionary with matches and optional close alternatives
         """
         # Build search query from candidate profile
         search_text = candidate.to_embedding_text()
@@ -173,55 +179,99 @@ class MatchingService:
         # Get filter IDs (declined jobs)
         filter_ids = candidate.declined_job_ids
         
-        # Perform vector search
+        # Perform vector search - fetch more to allow for post-filtering
         results = self.vector_service.search_by_text(
             query_text=search_text,
-            num_neighbors=num_results + len(filter_ids),
+            num_neighbors=(num_results + len(filter_ids)) * 5,  # Fetch 5x to have room for filtering
             filter_ids=filter_ids
         )
         
-        # Format results
-        matched_jobs = []
-        for result in results[:num_results]:
-            job = self.job_service.get_job(result["id"])
-            if job:
-                match_score = round(1 - result["distance"], 2)
-                formatted = self.job_service.format_job_for_display(
-                    job, include_match_score=True, match_score=match_score
-                )
-                matched_jobs.append(formatted)
+        min_salary = candidate.min_salary
+        salary_floor = min_salary * (1 - SALARY_TOLERANCE) if min_salary > 0 else 0
         
-        return {
+        # Post-filter results with two tiers: exact and close
+        exact_matches = []
+        close_matches = []
+        filtered_count = 0
+        
+        for result in results:
+            job = self.job_service.get_job(result["id"])
+            if not job:
+                continue
+            
+            # Check location type filter
+            if candidate.preferred_location_types:
+                if job.location_type not in candidate.preferred_location_types:
+                    filtered_count += 1
+                    continue
+            
+            # Check salary match level
+            match_score = round(1 - result["distance"], 2)
+            formatted = self.job_service.format_job_for_display(
+                job, include_match_score=True, match_score=match_score
+            )
+            
+            if min_salary > 0:
+                if job.salary_max >= min_salary:
+                    exact_matches.append(formatted)
+                elif job.salary_max >= salary_floor:
+                    # Add salary gap info for close matches
+                    salary_gap = min_salary - job.salary_max
+                    salary_gap_pct = round((salary_gap / min_salary) * 100, 1)
+                    formatted["salary_gap"] = f"${salary_gap:,} below ({salary_gap_pct}% less)"
+                    close_matches.append(formatted)
+                else:
+                    filtered_count += 1
+            else:
+                exact_matches.append(formatted)
+        
+        # Take top results
+        matched_jobs = exact_matches[:num_results]
+        
+        result = {
             "candidate_id": candidate.id,
             "matches": matched_jobs,
             "total_found": len(matched_jobs),
+            "filtered_out": filtered_count,
             "search_type": "vector"
         }
+        
+        # If no exact matches but have close matches, include them as alternatives
+        if len(matched_jobs) == 0 and len(close_matches) > 0:
+            result["close_alternatives"] = close_matches[:num_results]
+            result["note"] = f"No jobs found at ${min_salary:,}+, but found {len(close_matches)} options within {int(SALARY_TOLERANCE*100)}% (${salary_floor:,.0f}+)"
+        elif len(matched_jobs) > 0:
+            result["note"] = f"Found {len(matched_jobs)} jobs meeting your ${min_salary:,}+ requirement"
+        else:
+            result["note"] = f"No jobs found within {int(SALARY_TOLERANCE*100)}% of ${min_salary:,}"
+        
+        return result
     
     def _fallback_search(self, candidate: Candidate, num_results: int) -> dict:
         """Perform fallback skill-based matching.
         
         Used when vector search is not available.
-        Strictly filters by salary and location preferences.
+        Implements two-tier matching:
+        1. First, find exact matches (salary >= min_salary)
+        2. If no exact matches, find "close" matches within tolerance
         
         Args:
             candidate: The candidate to match
             num_results: Number of results to return
             
         Returns:
-            Dictionary with matches
+            Dictionary with matches and optional close alternatives
         """
-        scored_jobs = []
+        exact_matches = []
+        close_matches = []  # Jobs within salary tolerance
         filtered_count = 0
+        
+        min_salary = candidate.min_salary
+        salary_floor = min_salary * (1 - SALARY_TOLERANCE) if min_salary > 0 else 0
         
         for job in self.job_service.get_all_jobs():
             # Skip declined jobs
             if job.id in candidate.declined_job_ids:
-                continue
-            
-            # STRICT: Filter out jobs below salary requirement
-            if candidate.min_salary > 0 and job.salary_max < candidate.min_salary:
-                filtered_count += 1
                 continue
             
             # STRICT: Filter by location type if specified
@@ -230,38 +280,78 @@ class MatchingService:
                     filtered_count += 1
                     continue
             
+            # Check salary match level
+            salary_match = "none"
+            if min_salary > 0:
+                if job.salary_max >= min_salary:
+                    salary_match = "exact"
+                elif job.salary_max >= salary_floor:
+                    salary_match = "close"
+                else:
+                    filtered_count += 1
+                    continue
+            else:
+                salary_match = "exact"  # No salary requirement
+            
             # Score based on skill overlap
             skill_overlap = len(set(candidate.skills) & set(job.required_skills))
             
             # Bonus for meeting/exceeding salary
-            salary_bonus = 1.0 if job.salary_min >= candidate.min_salary else 0.5
+            salary_bonus = 1.0 if job.salary_min >= min_salary else 0.5
             
             # Bonus for industry match
             industry_bonus = 1.0 if job.industry in candidate.preferred_industries else 0.0
             
             score = (skill_overlap * 2) + salary_bonus + industry_bonus
-            scored_jobs.append((job, score))
+            
+            if salary_match == "exact":
+                exact_matches.append((job, score))
+            else:
+                close_matches.append((job, score))
         
-        # Sort by score descending
-        scored_jobs.sort(key=lambda x: x[1], reverse=True)
+        # Sort both lists by score descending
+        exact_matches.sort(key=lambda x: x[1], reverse=True)
+        close_matches.sort(key=lambda x: x[1], reverse=True)
         
-        # Format top results
+        # Format exact matches
         matched_jobs = []
-        for job, score in scored_jobs[:num_results]:
+        for job, score in exact_matches[:num_results]:
             match_score = round(min(score / 10, 1.0), 2)
             formatted = self.job_service.format_job_for_display(
                 job, include_match_score=True, match_score=match_score
             )
             matched_jobs.append(formatted)
         
-        return {
+        result = {
             "candidate_id": candidate.id,
             "matches": matched_jobs,
             "total_found": len(matched_jobs),
             "filtered_out": filtered_count,
             "search_type": "fallback",
-            "note": f"Filtered {filtered_count} jobs not meeting requirements"
         }
+        
+        # If no exact matches but have close matches, include them as alternatives
+        if len(matched_jobs) == 0 and len(close_matches) > 0:
+            close_alternatives = []
+            for job, score in close_matches[:num_results]:
+                match_score = round(min(score / 10, 1.0), 2)
+                formatted = self.job_service.format_job_for_display(
+                    job, include_match_score=True, match_score=match_score
+                )
+                # Add salary gap info
+                salary_gap = min_salary - job.salary_max
+                salary_gap_pct = round((salary_gap / min_salary) * 100, 1) if min_salary > 0 else 0
+                formatted["salary_gap"] = f"${salary_gap:,} below ({salary_gap_pct}% less)"
+                close_alternatives.append(formatted)
+            
+            result["close_alternatives"] = close_alternatives
+            result["note"] = f"No jobs found at ${min_salary:,}+, but found {len(close_alternatives)} options within {int(SALARY_TOLERANCE*100)}% (${salary_floor:,.0f}+)"
+        elif len(matched_jobs) > 0:
+            result["note"] = f"Found {len(matched_jobs)} jobs meeting your ${min_salary:,}+ requirement"
+        else:
+            result["note"] = f"No jobs found within {int(SALARY_TOLERANCE*100)}% of ${min_salary:,}"
+        
+        return result
     
     def search_jobs_by_text(
         self,
@@ -448,10 +538,11 @@ class MatchingService:
         num_results: int,
         preference_changes: Optional[dict] = None
     ) -> dict:
-        """Perform vector search with augmented criteria and post-filtering.
+        """Perform vector search with augmented criteria and salary tolerance.
         
-        Uses existing candidate embedding + augmented text for immediate results.
-        Applies STRICT post-filters for location type and job titles.
+        Uses two-tier matching:
+        1. Exact matches (salary >= min_salary)
+        2. Close matches within SALARY_TOLERANCE (15%)
         
         Args:
             candidate: The candidate
@@ -460,7 +551,7 @@ class MatchingService:
             preference_changes: Preference changes to apply as filters
             
         Returns:
-            Search results dictionary
+            Search results with matches and close_alternatives
         """
         preference_changes = preference_changes or {}
         
@@ -472,7 +563,7 @@ class MatchingService:
         filter_ids = candidate.declined_job_ids
         
         # Get more results to account for post-filtering
-        fetch_count = (num_results + len(filter_ids)) * 5
+        fetch_count = (num_results + len(filter_ids)) * 10
         
         results = self.vector_service.search_by_text(
             query_text=search_text,
@@ -487,14 +578,13 @@ class MatchingService:
         )
         required_titles = preference_changes.get("preferred_titles", candidate.preferred_titles or [])
         min_salary = preference_changes.get("min_salary", candidate.min_salary)
+        salary_floor = min_salary * (1 - SALARY_TOLERANCE) if min_salary > 0 else 0
         
-        matched_jobs = []
+        exact_matches = []
+        close_matches = []
         filtered_count = 0
         
         for result in results:
-            if len(matched_jobs) >= num_results:
-                break
-                
             job = self.job_service.get_job(result["id"])
             if not job:
                 continue
@@ -504,11 +594,6 @@ class MatchingService:
                 if job.location_type.value not in required_location_types:
                     filtered_count += 1
                     continue
-            
-            # STRICT: Filter by salary if specified
-            if min_salary > 0 and job.salary_max < min_salary:
-                filtered_count += 1
-                continue
             
             # STRICT: Filter by job title keywords if specified
             if required_titles:
@@ -520,13 +605,30 @@ class MatchingService:
                     filtered_count += 1
                     continue
             
+            # Check salary match level
             match_score = round(1 - result["distance"], 2)
             formatted = self.job_service.format_job_for_display(
                 job, include_match_score=True, match_score=match_score
             )
-            matched_jobs.append(formatted)
+            
+            if min_salary > 0:
+                if job.salary_max >= min_salary:
+                    exact_matches.append(formatted)
+                elif job.salary_max >= salary_floor:
+                    # Add salary gap info
+                    salary_gap = min_salary - job.salary_max
+                    salary_gap_pct = round((salary_gap / min_salary) * 100, 1)
+                    formatted["salary_gap"] = f"${salary_gap:,} below ({salary_gap_pct}% less)"
+                    close_matches.append(formatted)
+                else:
+                    filtered_count += 1
+            else:
+                exact_matches.append(formatted)
         
-        return {
+        # Take top results
+        matched_jobs = exact_matches[:num_results]
+        
+        result = {
             "candidate_id": candidate.id,
             "matches": matched_jobs,
             "total_found": len(matched_jobs),
@@ -538,6 +640,17 @@ class MatchingService:
                 "min_salary": min_salary
             }
         }
+        
+        # If no exact matches but have close matches, include as alternatives
+        if len(matched_jobs) == 0 and len(close_matches) > 0:
+            result["close_alternatives"] = close_matches[:num_results]
+            result["note"] = f"No jobs found at ${min_salary:,}+, but found {len(close_matches)} options within {int(SALARY_TOLERANCE*100)}% (${salary_floor:,.0f}+)"
+        elif len(matched_jobs) > 0:
+            result["note"] = f"Found {len(matched_jobs)} jobs meeting your ${min_salary:,}+ requirement"
+        else:
+            result["note"] = f"No jobs found within {int(SALARY_TOLERANCE*100)}% of ${min_salary:,}"
+        
+        return result
     
     def _fallback_search_augmented(
         self,
@@ -545,7 +658,11 @@ class MatchingService:
         preference_changes: dict,
         num_results: int
     ) -> dict:
-        """Fallback search with STRICT filtering based on preference changes.
+        """Fallback search with filtering and salary tolerance.
+        
+        Uses two-tier matching:
+        1. Exact matches (salary >= min_salary)
+        2. Close matches within SALARY_TOLERANCE (15%)
         
         Args:
             candidate: The candidate
@@ -553,10 +670,11 @@ class MatchingService:
             num_results: Number of results
             
         Returns:
-            Search results dictionary
+            Search results with matches and close_alternatives
         """
         # Apply preference changes for filtering
         min_salary = preference_changes.get("min_salary", candidate.min_salary)
+        salary_floor = min_salary * (1 - SALARY_TOLERANCE) if min_salary > 0 else 0
         preferred_locations = preference_changes.get(
             "preferred_location_types", 
             [lt.value for lt in candidate.preferred_location_types] if candidate.preferred_location_types else []
@@ -570,7 +688,8 @@ class MatchingService:
             candidate.preferred_titles or []
         )
         
-        scored_jobs = []
+        exact_matches = []
+        close_matches = []
         filtered_count = 0
         
         for job in self.job_service.get_all_jobs():
@@ -583,11 +702,6 @@ class MatchingService:
                     filtered_count += 1
                     continue
             
-            # STRICT: Filter by salary
-            if min_salary > 0 and job.salary_max < min_salary:
-                filtered_count += 1
-                continue
-            
             # STRICT: Filter by job title keywords if specified
             if preferred_titles:
                 title_match = any(
@@ -597,6 +711,19 @@ class MatchingService:
                 if not title_match:
                     filtered_count += 1
                     continue
+            
+            # Check salary match level
+            salary_match = "none"
+            if min_salary > 0:
+                if job.salary_max >= min_salary:
+                    salary_match = "exact"
+                elif job.salary_max >= salary_floor:
+                    salary_match = "close"
+                else:
+                    filtered_count += 1
+                    continue
+            else:
+                salary_match = "exact"
             
             score = 0.0
             
@@ -612,23 +739,28 @@ class MatchingService:
             if job.industry in preferred_industries:
                 score += 2
             
-            # Title match bonus (already filtered, so this is extra)
+            # Title match bonus
             if preferred_titles:
-                score += 3  # Bonus for matching title
+                score += 3
             
-            scored_jobs.append((job, score))
+            if salary_match == "exact":
+                exact_matches.append((job, score))
+            else:
+                close_matches.append((job, score))
         
-        scored_jobs.sort(key=lambda x: x[1], reverse=True)
+        exact_matches.sort(key=lambda x: x[1], reverse=True)
+        close_matches.sort(key=lambda x: x[1], reverse=True)
         
+        # Format exact matches
         matched_jobs = []
-        for job, score in scored_jobs[:num_results]:
+        for job, score in exact_matches[:num_results]:
             match_score = round(min(score / 10, 1.0), 2)
             formatted = self.job_service.format_job_for_display(
                 job, include_match_score=True, match_score=match_score
             )
             matched_jobs.append(formatted)
         
-        return {
+        result = {
             "candidate_id": candidate.id,
             "matches": matched_jobs,
             "total_found": len(matched_jobs),
@@ -638,9 +770,31 @@ class MatchingService:
                 "location_types": preferred_locations,
                 "job_titles": preferred_titles,
                 "min_salary": min_salary
-            },
-            "note": f"Filtered {filtered_count} jobs not meeting requirements"
+            }
         }
+        
+        # If no exact matches but have close matches, include as alternatives
+        if len(matched_jobs) == 0 and len(close_matches) > 0:
+            close_alternatives = []
+            for job, score in close_matches[:num_results]:
+                match_score = round(min(score / 10, 1.0), 2)
+                formatted = self.job_service.format_job_for_display(
+                    job, include_match_score=True, match_score=match_score
+                )
+                # Add salary gap info
+                salary_gap = min_salary - job.salary_max
+                salary_gap_pct = round((salary_gap / min_salary) * 100, 1) if min_salary > 0 else 0
+                formatted["salary_gap"] = f"${salary_gap:,} below ({salary_gap_pct}% less)"
+                close_alternatives.append(formatted)
+            
+            result["close_alternatives"] = close_alternatives
+            result["note"] = f"No jobs found at ${min_salary:,}+, but found {len(close_alternatives)} options within {int(SALARY_TOLERANCE*100)}% (${salary_floor:,.0f}+)"
+        elif len(matched_jobs) > 0:
+            result["note"] = f"Found {len(matched_jobs)} jobs meeting your ${min_salary:,}+ requirement"
+        else:
+            result["note"] = f"No jobs found within {int(SALARY_TOLERANCE*100)}% of ${min_salary:,}"
+        
+        return result
     
     def _soft_match_search(
         self,

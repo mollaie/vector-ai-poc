@@ -175,7 +175,22 @@ def update_candidate_preferences(
             state["last_job_ids"] = [m["id"] for m in result["matches"]]
         result["total_found"] = search_result.get("total_found", 0)
         result["search_type"] = search_result.get("search_type", "unknown")
-        result["message"] = f"Updated preferences and found {result['total_found']} matching jobs."
+        
+        # IMPORTANT: Pass through close_alternatives for salary tolerance matching
+        if "close_alternatives" in search_result:
+            result["close_alternatives"] = search_result["close_alternatives"]
+        
+        # Pass through the smart note
+        if "note" in search_result:
+            result["note"] = search_result["note"]
+        
+        # Build appropriate message
+        if result["total_found"] > 0:
+            result["message"] = f"Updated preferences and found {result['total_found']} matching jobs."
+        elif "close_alternatives" in result and len(result["close_alternatives"]) > 0:
+            result["message"] = f"No exact matches at your criteria, but found {len(result['close_alternatives'])} close alternatives within 15% of your salary target."
+        else:
+            result["message"] = "Updated preferences but no matching jobs found. Consider adjusting your criteria."
     else:
         result["message"] = "Preferences updated successfully."
     
