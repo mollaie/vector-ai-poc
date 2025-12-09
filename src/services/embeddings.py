@@ -115,6 +115,17 @@ class EmbeddingService:
         """
         return self.get_embedding(document, task_type="RETRIEVAL_DOCUMENT")
     
+    def generate_embedding(self, text: str) -> list[float]:
+        """Alias for get_embedding (for compatibility).
+        
+        Args:
+            text: Text to embed
+        
+        Returns:
+            Embedding vector
+        """
+        return self.get_embedding(text)
+    
     async def get_embedding_async(
         self,
         text: str,

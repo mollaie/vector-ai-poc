@@ -21,6 +21,8 @@ from src.services.candidate_service import CandidateService, get_candidate_servi
 from src.services.matching_service import MatchingService, get_matching_service
 from src.services.embeddings import EmbeddingService, get_embedding_service
 from src.services.vector_search import VectorSearchService, get_vector_search_service
+from src.services.cache_service import CacheService, get_cache_service
+from src.services.async_embedding_service import AsyncEmbeddingService, get_async_embedding_service
 
 __all__ = [
     # Job Service
@@ -38,4 +40,10 @@ __all__ = [
     # Vector Search Service
     "VectorSearchService",
     "get_vector_search_service",
+    # Cache Service
+    "CacheService",
+    "get_cache_service",
+    # Async Embedding Service
+    "AsyncEmbeddingService",
+    "get_async_embedding_service",
 ]
